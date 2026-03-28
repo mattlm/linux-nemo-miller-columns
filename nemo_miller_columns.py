@@ -85,7 +85,7 @@ class ColumnView(Gtk.Box):
         # ListBox for items
         self.listbox = Gtk.ListBox()
         self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.listbox.connect("row-selected", self._on_row_selected)
+        self._row_selected_handler = self.listbox.connect("row-selected", self._on_row_selected)
         self.listbox.connect("row-activated", self._on_row_activated)
         self.listbox.get_style_context().add_class("miller-column")
 
@@ -178,7 +178,9 @@ class ColumnView(Gtk.Box):
         path = Path(path)
         for row in self.listbox.get_children():
             if hasattr(row, 'item') and row.item.path == path:
+                self.listbox.handler_block(self._row_selected_handler)
                 self.listbox.select_row(row)
+                self.listbox.handler_unblock(self._row_selected_handler)
                 return True
         return False
 
