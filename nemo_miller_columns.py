@@ -65,6 +65,8 @@ class ColumnView(Gtk.Box):
     """A single column in the Miller view"""
 
     MIN_WIDTH = 100
+    COLUMN_DEFAULT_WIDTH = 250
+    COLUMN_MAX_WIDTH = 500
 
     def __init__(self, path, on_item_selected, on_item_activated):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
@@ -85,6 +87,7 @@ class ColumnView(Gtk.Box):
         # ListBox for items
         self.listbox = Gtk.ListBox()
         self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.set_hexpand(True)
         self._row_selected_handler = self.listbox.connect("row-selected", self._on_row_selected)
         self.listbox.connect("row-activated", self._on_row_activated)
         self.listbox.get_style_context().add_class("miller-column")
@@ -132,8 +135,11 @@ class ColumnView(Gtk.Box):
         """Creates a row for an item"""
         row = Gtk.ListBoxRow()
         row.item = item
+        row.set_halign(Gtk.Align.FILL)
 
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox.set_halign(Gtk.Align.FILL)
+        hbox.set_hexpand(True)
         hbox.set_margin_start(8)
         hbox.set_margin_end(8)
         hbox.set_margin_top(4)
@@ -172,6 +178,12 @@ class ColumnView(Gtk.Box):
         """Handles row activation (double-click)"""
         if row and hasattr(row, 'item'):
             self.on_item_activated(row.item)
+
+    def repopulate(self, new_path):
+        """Repopulates the column for a new path, reusing the existing widget"""
+        self.path = Path(new_path)
+        self.populate()
+        self.listbox.unselect_all()
 
     def select_path(self, path):
         """Selects an item by its path"""
@@ -661,78 +673,106 @@ class MillerColumnsContainer(Gtk.Box):
         self.columns = []  # List of ColumnView
         self.handles = []  # List of ResizeHandle
         self.column_widths = []  # Column widths (-1 = auto)
+        self.auto_size = True
+
+        # Hidden widget pools for reuse (avoids destroy/recreate flash)
+        self._hidden_columns = []
+        self._hidden_handles = []
 
         self.get_style_context().add_class("miller-columns-container")
 
     def add_column(self, path):
-        """Adds a new column"""
-        column = ColumnView(path, self._on_item_selected, self.on_item_activated_callback)
+        """Adds a new column, reusing a hidden widget from the pool if available"""
+        if self._hidden_columns:
+            column = self._hidden_columns.pop(0)
+            column.repopulate(path)
+            reused = True
+        else:
+            column = ColumnView(path, self._on_item_selected, self.on_item_activated_callback)
+            reused = False
 
-        # If there are existing columns, add a resize handle
+        # Add resize handle between columns
         if self.columns:
-            handle = ResizeHandle(self._on_handle_drag)
-            handle.column_index = len(self.columns) - 1
+            if self._hidden_handles:
+                handle = self._hidden_handles.pop(0)
+                handle.column_index = len(self.columns) - 1
+                handle.show()
+            else:
+                handle = ResizeHandle(self._on_handle_drag)
+                handle.column_index = len(self.columns) - 1
+                self.pack_start(handle, False, False, 0)
+                handle.show_all()
             self.handles.append(handle)
-            self.pack_start(handle, False, False, 0)
-            handle.show_all()
 
         self.columns.append(column)
-        self.column_widths.append(-1)  # -1 means "auto"
+        self.column_widths.append(-1)
 
-        self.pack_start(column, True, True, 0)
+        if reused:
+            self.set_child_packing(column, True, True, 0, Gtk.PackType.START)
+        else:
+            self.pack_start(column, True, True, 0)
+
+        if not self.auto_size:
+            column.set_size_request(ColumnView.COLUMN_DEFAULT_WIDTH, -1)
+
         column.show_all()
 
-        # Recalculate widths
-        GLib.idle_add(self._distribute_widths)
+        if self.auto_size:
+            GLib.idle_add(self._distribute_widths)
+        else:
+            GLib.idle_add(self._scroll_to_end)
 
         return column
 
     def remove_columns_after(self, column):
-        """Removes all columns after the specified one"""
+        """Hides all columns after the specified one into the reuse pool"""
         if column not in self.columns:
             return
 
         idx = self.columns.index(column)
 
-        # Remove columns and handles
         while len(self.columns) > idx + 1:
             col = self.columns.pop()
-            self.remove(col)
-            col.destroy()
+            col.hide()
+            self._hidden_columns.insert(0, col)
             self.column_widths.pop()
 
             if self.handles:
                 handle = self.handles.pop()
-                self.remove(handle)
-                handle.destroy()
+                handle.hide()
+                self._hidden_handles.insert(0, handle)
 
-        # Recalculate widths
-        GLib.idle_add(self._distribute_widths)
+        if self.auto_size:
+            GLib.idle_add(self._distribute_widths)
 
     def clear(self):
-        """Removes all columns"""
-        for col in self.columns:
-            self.remove(col)
-            col.destroy()
-        for handle in self.handles:
-            self.remove(handle)
-            handle.destroy()
-        self.columns.clear()
-        self.handles.clear()
+        """Hides all columns into the reuse pool"""
+        while self.columns:
+            col = self.columns.pop()
+            col.hide()
+            self._hidden_columns.insert(0, col)
+        while self.handles:
+            handle = self.handles.pop()
+            handle.hide()
+            self._hidden_handles.insert(0, handle)
         self.column_widths.clear()
 
     def _on_item_selected(self, column, item):
         """Handles selection and recalculates widths"""
         self.on_item_selected_callback(column, item)
-        GLib.idle_add(self._distribute_widths)
+        if self.auto_size:
+            GLib.idle_add(self._distribute_widths)
 
     def _distribute_widths(self):
         """Distributes widths equally among columns"""
-        if not self.columns:
+        if not self.auto_size or not self.columns:
             return False
 
-        allocation = self.get_allocation()
-        total_width = allocation.width
+        # Use the scroll viewport width when available so columns fill it exactly
+        if hasattr(self, 'scroll_window'):
+            total_width = self.scroll_window.get_allocated_width()
+        else:
+            total_width = self.get_allocation().width
 
         if total_width <= 1:
             return False
@@ -777,24 +817,37 @@ class MillerColumnsContainer(Gtk.Box):
         new_left = left_width + delta
         new_right = right_width - delta
 
-        # Respect minimum widths
-        if new_left < ColumnView.MIN_WIDTH:
-            delta = ColumnView.MIN_WIDTH - left_width
-            new_left = ColumnView.MIN_WIDTH
-            new_right = right_width - delta
-
-        if new_right < ColumnView.MIN_WIDTH:
-            delta = right_width - ColumnView.MIN_WIDTH
-            new_right = ColumnView.MIN_WIDTH
-            new_left = left_width + delta
+        # Respect min/max widths
+        new_left = max(ColumnView.MIN_WIDTH, min(ColumnView.COLUMN_MAX_WIDTH, new_left))
+        new_right = max(ColumnView.MIN_WIDTH, min(ColumnView.COLUMN_MAX_WIDTH, new_right))
 
         # Update stored widths
-        self.column_widths[idx] = max(ColumnView.MIN_WIDTH, int(new_left))
-        self.column_widths[idx + 1] = max(ColumnView.MIN_WIDTH, int(new_right))
+        self.column_widths[idx] = int(new_left)
+        self.column_widths[idx + 1] = int(new_right)
 
         # Apply
         left_col.set_size_request(self.column_widths[idx], -1)
         right_col.set_size_request(self.column_widths[idx + 1], -1)
+
+    def set_auto_size(self, enabled):
+        """Switches between auto-fit (distribute widths) and fixed-width + scroll modes"""
+        self.auto_size = enabled
+        if enabled:
+            GLib.idle_add(self._distribute_widths)
+        else:
+            for col in self.columns:
+                w = col.get_allocation().width
+                col.set_size_request(
+                    max(ColumnView.MIN_WIDTH, w if w > 1 else ColumnView.COLUMN_DEFAULT_WIDTH), -1
+                )
+            GLib.idle_add(self._scroll_to_end)
+
+    def _scroll_to_end(self):
+        """Scrolls the columns viewport to reveal the rightmost column"""
+        if hasattr(self, 'scroll_window'):
+            adj = self.scroll_window.get_hadjustment()
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+        return False
 
 
 class MillerColumnsWindow(Gtk.ApplicationWindow):
@@ -835,8 +888,12 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
             self._on_item_selected,
             self._on_item_activated
         )
+        self.columns_scroll = Gtk.ScrolledWindow()
+        self.columns_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self.columns_scroll.add(self.columns_container)
+        self.columns_container.scroll_window = self.columns_scroll
         columns_frame = Gtk.Frame()
-        columns_frame.add(self.columns_container)
+        columns_frame.add(self.columns_scroll)
         self.content_stack.add_named(columns_frame, "columns")
 
         # Search results view
@@ -860,6 +917,7 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         self._navigate_to(self.current_path)
 
         self.connect("key-press-event", self._on_key_press)
+        self.connect("configure-event", self._on_window_configure)
         self.show_all()
 
     def _setup_css(self):
@@ -968,6 +1026,16 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         self.search_entry.connect("stop-search", self._on_search_stopped)
         toolbar_box.pack_start(self.search_entry, False, False, 0)
 
+        # Auto-fit columns toggle
+        self.auto_size_btn = Gtk.ToggleButton()
+        self.auto_size_btn.set_image(
+            Gtk.Image.new_from_icon_name("zoom-fit-best-symbolic", Gtk.IconSize.BUTTON)
+        )
+        self.auto_size_btn.set_tooltip_text("Auto-fit columns to window width")
+        self.auto_size_btn.set_active(True)
+        self.auto_size_btn.connect("toggled", self._on_toggle_auto_size)
+        toolbar_box.pack_end(self.auto_size_btn, False, False, 0)
+
         # Open in Nemo button
         nemo_btn = Gtk.Button.new_from_icon_name("folder-open-symbolic", Gtk.IconSize.BUTTON)
         nemo_btn.set_tooltip_text("Open in Nemo")
@@ -1065,6 +1133,16 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
     def _on_go_home(self, button):
         """Goes to home directory"""
         self._navigate_to(Path.home())
+
+    def _on_toggle_auto_size(self, button):
+        """Toggles auto-fit column width mode"""
+        self.columns_container.set_auto_size(button.get_active())
+
+    def _on_window_configure(self, widget, event):
+        """Recalculates column widths when the window is resized"""
+        if self.columns_container.auto_size:
+            GLib.idle_add(self.columns_container._distribute_widths)
+        return False
 
     def _on_path_button_clicked(self, button):
         """Handles path button click"""
